@@ -1,0 +1,27 @@
+# Copy to config.toml and adjust. config.toml is gitignored.
+
+[device]
+host = "BITAXE_IP_OR_HOSTNAME"  # e.g. 192.168.1.50 or bitaxe.local
+timeout_seconds = 5
+
+[expected]
+frequency = 525               # MHz, exact setpoint; alarm on any change
+core_voltage = 1150           # mV setpoint; alarm on any change
+
+[thresholds]
+hashrate_min_pct = 85         # alarm if hashRate_10m < 85% of expectedHashrate
+temp_max = 68                 # C, ASIC (sits near temptarget 60 under autofan)
+vr_temp_max = 90              # C, voltage regulator (reads ~77)
+input_voltage_min = 4900      # mV, alarm if 5V input sags below (reads ~5300)
+input_voltage_max = 5500      # mV, alarm if input runs high
+power_max = 30                # W, alarm above (reads ~19, maxPower 40)
+
+[ntfy]
+server = "https://ntfy.sh"
+topic = "bitaxe-CHANGEME"     # pick a private, hard-to-guess topic name
+priority = "high"
+
+[alerting]
+state_file = "~/.local/state/bitaxe-health/state.json"
+realert_hours = 6             # if still unhealthy, re-push at most this often
+notify_on_recovery = true     # push once when it returns to healthy
