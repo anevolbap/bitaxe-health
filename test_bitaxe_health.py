@@ -1,8 +1,12 @@
 """Tests for the pure check core. No network needed."""
 
 import copy
+import json
+import os
 
 import bitaxe_health as bh
+
+ALERTING = {"realert_hours": 6, "notify_on_recovery": True, "fail_streak": 2}
 
 # Trimmed /api/system/info payload from a healthy Gamma.
 HEALTHY_INFO = {
@@ -119,3 +123,63 @@ def test_should_alert_transitions():
 
     stale = {"status": "unhealthy", "failures": ["temp"], "last_alert": now - 7 * 3600}
     assert bh.should_alert(stale, ["temp"], now, 6) is True
+
+
+HEALTHY_STATE = {"status": "healthy", "failures": [], "last_alert": 0, "streak": 0}
+
+
+def test_debounce_suppresses_first_bad_check():
+    # First failure with fail_streak=2: streak 1, no alarm, status stays healthy.
+    state, action = bh.next_state(HEALTHY_STATE, False, ["temp"], 1000, ALERTING)
+    assert action == "none"
+    assert state["streak"] == 1
+    assert state["status"] == "healthy"
+
+
+def test_debounce_alarms_on_second_consecutive_bad_check():
+    after_one = {"status": "healthy", "failures": ["temp"], "last_alert": 0, "streak": 1}
+    state, action = bh.next_state(after_one, False, ["temp"], 1000, ALERTING)
+    assert action == "alarm"
+    assert state["streak"] == 2
+    assert state["status"] == "unhealthy"
+    assert state["last_alert"] == 1000
+
+
+def test_single_blip_then_recover_does_not_alarm_or_recover():
+    # streak 1 (no alarm), then healthy again -> no recover push since never alarmed.
+    after_blip = {"status": "healthy", "failures": ["temp"], "last_alert": 0, "streak": 1}
+    state, action = bh.next_state(after_blip, True, [], 1000, ALERTING)
+    assert action == "none"
+    assert state == HEALTHY_STATE
+
+
+def test_recover_after_real_alarm():
+    unhealthy = {"status": "unhealthy", "failures": ["temp"], "last_alert": 900, "streak": 3}
+    state, action = bh.next_state(unhealthy, True, [], 1000, ALERTING)
+    assert action == "recover"
+    assert state == HEALTHY_STATE
+
+
+def test_realert_throttled_while_unhealthy():
+    unhealthy = {"status": "unhealthy", "failures": ["temp"], "last_alert": 1000, "streak": 3}
+    state, action = bh.next_state(unhealthy, False, ["temp"], 1000 + 3600, ALERTING)
+    assert action == "none"  # within realert_hours, same fault
+    assert state["status"] == "unhealthy"
+
+
+def test_fail_streak_one_alarms_immediately():
+    alerting = {"realert_hours": 6, "notify_on_recovery": True, "fail_streak": 1}
+    _, action = bh.next_state(HEALTHY_STATE, False, ["temp"], 1000, alerting)
+    assert action == "alarm"
+
+
+def test_save_state_dirless_path_does_not_crash(tmp_path):
+    # Regression: os.path.dirname("state.json") == "" once crashed makedirs.
+    cwd = os.getcwd()
+    os.chdir(tmp_path)
+    try:
+        bh.save_state("state.json", HEALTHY_STATE)
+        with open("state.json") as f:
+            assert json.load(f) == HEALTHY_STATE
+    finally:
+        os.chdir(cwd)

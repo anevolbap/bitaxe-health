@@ -113,11 +113,13 @@ def load_state(path):
         with open(path) as f:
             return json.load(f)
     except (FileNotFoundError, ValueError):
-        return {"status": "healthy", "failures": [], "last_alert": 0}
+        return {"status": "healthy", "failures": [], "last_alert": 0, "streak": 0}
 
 
 def save_state(path, state):
-    os.makedirs(os.path.dirname(path), exist_ok=True)
+    d = os.path.dirname(path)
+    if d:
+        os.makedirs(d, exist_ok=True)
     with open(path, "w") as f:
         json.dump(state, f)
 
@@ -136,6 +138,38 @@ def should_alert(prev, keys, now, realert_hours):
     return (now - prev.get("last_alert", 0)) >= realert_hours * 3600
 
 
+def next_state(prev, healthy, keys, now, alerting):
+    """Pure decision core. Returns (new_state, action).
+
+    action is one of "none", "alarm", "recover". Debounce via fail_streak: an
+    unhealthy result must repeat fail_streak times in a row before it alarms, so
+    a single missed poll or transient blip does not fire.
+    """
+    if healthy:
+        action = "recover" if (prev.get("status") == "unhealthy"
+                               and alerting.get("notify_on_recovery")) else "none"
+        return {"status": "healthy", "failures": [], "last_alert": 0, "streak": 0}, action
+
+    fail_streak = alerting.get("fail_streak", 1)
+    streak = prev.get("streak", 0) + 1
+    state = {"failures": keys, "streak": streak}
+
+    if streak < fail_streak:
+        # Not enough consecutive failures yet: stay quiet, keep prior alarm status.
+        state["status"] = prev.get("status", "healthy")
+        state["last_alert"] = prev.get("last_alert", 0)
+        return state, "none"
+
+    if should_alert(prev, keys, now, alerting["realert_hours"]):
+        state["status"] = "unhealthy"
+        state["last_alert"] = now
+        return state, "alarm"
+
+    state["status"] = "unhealthy"
+    state["last_alert"] = prev.get("last_alert", 0)
+    return state, "none"
+
+
 def send_ntfy(ntfy, title, body, priority=None):
     url = f"{ntfy['server'].rstrip('/')}/{ntfy['topic']}"
     headers = {"Title": title, "Priority": priority or ntfy.get("priority", "default")}
@@ -145,12 +179,34 @@ def send_ntfy(ntfy, title, body, priority=None):
             raise ValueError(f"ntfy HTTP {resp.status}")
 
 
-def main(argv=None):
-    parser = argparse.ArgumentParser(description="Bitaxe health check")
-    parser.add_argument("--config", default="config.toml", help="path to config.toml")
-    args = parser.parse_args(argv)
+def send_heartbeat(hb):
+    """Ping a dead-man's-switch URL so a stopped or crashed monitor gets noticed.
 
-    config = load_config(args.config)
+    Called only after a check cycle completes, so if the script never runs (cron
+    off, bad config, crash) the external monitor stops seeing pings and alarms.
+    A failed ping is logged, not fatal.
+    """
+    url = hb.get("ping_url") if hb else None
+    if not url:
+        return
+    try:
+        with urllib.request.urlopen(url, timeout=10):
+            pass
+    except (urllib.error.URLError, OSError) as e:
+        print(f"heartbeat ping failed: {e}", file=sys.stderr)
+
+
+def _push(ntfy, title, body, priority, now, prev):
+    """Send an ntfy push; return the new last_alert (now on success, else old)."""
+    try:
+        send_ntfy(ntfy, title, body, priority=priority)
+        return now
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"ntfy send failed: {e}", file=sys.stderr)
+        return prev.get("last_alert", 0)
+
+
+def run_checks(config):
     dev = config["device"]
     ntfy = config["ntfy"]
     alerting = config["alerting"]
@@ -158,55 +214,62 @@ def main(argv=None):
     now = int(time.time())
     prev = load_state(state_path)
 
-    # Fetch. A failure here is its own alarm.
+    # Fetch. A failure here is its own alarm (subject to the same debounce).
     try:
         info = fetch_info(dev["host"], dev.get("timeout_seconds", 5))
     except (urllib.error.URLError, OSError, ValueError) as e:
-        msg = f"Bitaxe unreachable at {dev['host']}: {e}"
-        print(msg, file=sys.stderr)
-        keys = ["unreachable"]
-        if should_alert(prev, keys, now, alerting["realert_hours"]):
-            try:
-                send_ntfy(ntfy, "Bitaxe DOWN", msg, priority="urgent")
-                now_alert = now
-            except (urllib.error.URLError, OSError, ValueError) as ne:
-                print(f"ntfy send failed: {ne}", file=sys.stderr)
-                now_alert = prev.get("last_alert", 0)
+        body = f"Bitaxe unreachable at {dev['host']}: {e}"
+        state, action = next_state(prev, False, ["unreachable"], now, alerting)
+        if action == "alarm":
+            state["last_alert"] = _push(ntfy, "Bitaxe DOWN", body, "urgent", now, prev)
+            print(f"UNREACHABLE (alarm): {e}", file=sys.stderr)
         else:
-            now_alert = prev.get("last_alert", 0)
-        save_state(state_path, {"status": "unhealthy", "failures": keys, "last_alert": now_alert})
+            print(f"UNREACHABLE (streak {state['streak']}, no push): {e}", file=sys.stderr)
+        save_state(state_path, state)
         return UNREACHABLE
 
     failures = evaluate(info, config)
 
     if not failures:
-        # Healthy now. Notify recovery once if we were unhealthy.
-        if prev["status"] == "unhealthy" and alerting.get("notify_on_recovery"):
+        state, action = next_state(prev, True, [], now, alerting)
+        if action == "recover":
             try:
                 send_ntfy(ntfy, "Bitaxe recovered", "All checks back to normal.", priority="default")
             except (urllib.error.URLError, OSError, ValueError) as e:
                 print(f"ntfy send failed: {e}", file=sys.stderr)
-        save_state(state_path, {"status": "healthy", "failures": [], "last_alert": 0})
+        save_state(state_path, state)
         print(f"OK: healthy. hashRate_10m={info.get('hashRate_10m')} temp={info.get('temp')} "
               f"freq={info.get('frequency')} coreV={info.get('coreVoltage')}")
         return OK
 
     keys = [k for k, _ in failures]
     body = "\n".join(m for _, m in failures)
-    print(f"UNHEALTHY: {body.replace(chr(10), '; ')}", file=sys.stderr)
+    one_line = body.replace(chr(10), "; ")
+    state, action = next_state(prev, False, keys, now, alerting)
 
-    if should_alert(prev, keys, now, alerting["realert_hours"]):
-        try:
-            send_ntfy(ntfy, "Bitaxe alarm", body)
-            last_alert = now
-        except (urllib.error.URLError, OSError, ValueError) as e:
-            print(f"ntfy send failed: {e}", file=sys.stderr)
-            last_alert = prev.get("last_alert", 0)
+    if action == "alarm":
+        state["last_alert"] = _push(ntfy, "Bitaxe alarm", body, None, now, prev)
+        print(f"UNHEALTHY (alarm): {one_line}", file=sys.stderr)
+    elif state["status"] == "unhealthy":
+        print(f"UNHEALTHY (throttled): {one_line}", file=sys.stderr)
     else:
-        last_alert = prev.get("last_alert", 0)
+        print(f"UNHEALTHY (streak {state['streak']}, no push): {one_line}", file=sys.stderr)
 
-    save_state(state_path, {"status": "unhealthy", "failures": keys, "last_alert": last_alert})
+    save_state(state_path, state)
     return UNHEALTHY
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="Bitaxe health check")
+    parser.add_argument("--config", default="config.toml", help="path to config.toml")
+    args = parser.parse_args(argv)
+
+    config = load_config(args.config)
+    code = run_checks(config)
+    # Only reached if the run completed without an unhandled exception, so a
+    # crashing script stops pinging and the dead-man's-switch fires.
+    send_heartbeat(config.get("heartbeat", {}))
+    return code
 
 
 if __name__ == "__main__":

@@ -18,10 +18,18 @@ power_max = 30                # W, alarm above (reads ~19, maxPower 40)
 
 [ntfy]
 server = "https://ntfy.sh"
-topic = "bitaxe-CHANGEME"     # pick a private, hard-to-guess topic name
+topic = "bitaxe-CHANGEME"     # SECRET: anyone with this can read and post your alarms
 priority = "high"
 
 [alerting]
 state_file = "~/.local/state/bitaxe-health/state.json"
 realert_hours = 6             # if still unhealthy, re-push at most this often
 notify_on_recovery = true     # push once when it returns to healthy
+fail_streak = 2               # require N consecutive bad checks before alarming
+                              # (debounces wifi blips; 1 = alarm on first bad check)
+
+[heartbeat]
+# Optional dead-man's-switch. Leave empty to disable. Point ping_url at a check-in
+# service (e.g. healthchecks.io) that alarms when it stops hearing from this script,
+# so a stopped cron, bad config, or crash gets noticed. Pinged on every completed run.
+ping_url = ""

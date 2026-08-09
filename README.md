@@ -45,6 +45,23 @@ To avoid a push every 5 minutes while a fault persists, state is kept in
 - Push again if a new kind of fault appears, or after `realert_hours` (default 6).
 - Push once when it recovers (if `notify_on_recovery`).
 
+A fault must repeat `fail_streak` checks in a row before it alarms (default 2), so a
+single missed poll or wifi blip does not fire. Set `fail_streak = 1` to alarm on the
+first bad check.
+
+Note: the ntfy topic is effectively a shared password. Anyone who knows it can read
+your alarms and post to the topic. Pick a long, random name, and consider an ntfy
+access token or a self-hosted server if that matters. The call to the miner itself is
+plain HTTP, which is fine on a trusted LAN.
+
+## Heartbeat (dead-man's-switch)
+
+The check only alarms when it runs. If cron stops, the config breaks, or the script
+crashes, you would get silence, not an alarm. To catch that, set `heartbeat.ping_url`
+to a check-in service (for example a [healthchecks.io](https://healthchecks.io) URL).
+The script pings it on every completed run; if the pings stop, that service alarms.
+Leave `ping_url` empty to disable.
+
 ## Install the cron job
 
 ```sh
