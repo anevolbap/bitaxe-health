@@ -183,3 +183,41 @@ def test_save_state_dirless_path_does_not_crash(tmp_path):
             assert json.load(f) == HEALTHY_STATE
     finally:
         os.chdir(cwd)
+
+
+def test_info_url_defaults_to_http_and_respects_scheme():
+    assert bh.info_url("192.168.0.139") == "http://192.168.0.139/api/system/info"
+    assert bh.info_url("bitaxe.lan") == "http://bitaxe.lan/api/system/info"
+    assert bh.info_url("https://bitaxe.lan") == "https://bitaxe.lan/api/system/info"
+
+
+def _run_config(state_file):
+    return {
+        "device": {"host": "x"},
+        "ntfy": {"server": "https://ntfy.sh", "topic": "t"},
+        "alerting": {"state_file": str(state_file), "realert_hours": 6,
+                     "notify_on_recovery": True, "fail_streak": 2},
+        "expected": CONFIG["expected"],
+        "thresholds": CONFIG["thresholds"],
+    }
+
+
+def test_recovery_push_retried_when_send_fails(tmp_path, monkeypatch):
+    state_file = tmp_path / "state.json"
+    state_file.write_text(json.dumps(
+        {"status": "unhealthy", "failures": ["temp"], "last_alert": 900, "streak": 3}))
+    config = _run_config(state_file)
+    monkeypatch.setattr(bh, "fetch_info", lambda host, timeout: dict(HEALTHY_INFO))
+
+    def boom(*a, **k):
+        raise OSError("no net")
+
+    monkeypatch.setattr(bh, "send_ntfy", boom)
+    assert bh.run_checks(config) == bh.OK
+    # Recovery send failed, so state must stay unhealthy to retry next run.
+    assert json.loads(state_file.read_text())["status"] == "unhealthy"
+
+    # Next run with a working ntfy: recovery sends and state clears to healthy.
+    monkeypatch.setattr(bh, "send_ntfy", lambda *a, **k: None)
+    assert bh.run_checks(config) == bh.OK
+    assert json.loads(state_file.read_text())["status"] == "healthy"

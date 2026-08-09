@@ -51,8 +51,12 @@ first bad check.
 
 Note: the ntfy topic is effectively a shared password. Anyone who knows it can read
 your alarms and post to the topic. Pick a long, random name, and consider an ntfy
-access token or a self-hosted server if that matters. The call to the miner itself is
-plain HTTP, which is fine on a trusted LAN.
+access token or a self-hosted server if that matters.
+
+The call to the miner is plain HTTP, which is what AxeOS serves and is expected on a
+trusted LAN. If you front the miner with a TLS reverse proxy, put the full scheme in
+`host` (for example `host = "https://bitaxe.lan"`) and the check will use it; a bare
+host defaults to `http://`.
 
 ## Heartbeat (dead-man's-switch)
 

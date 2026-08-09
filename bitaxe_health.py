@@ -26,13 +26,24 @@ def load_config(path):
         return tomllib.load(f)
 
 
+def info_url(host):
+    """Build the info endpoint URL.
+
+    host may include a scheme (use https:// if the miner sits behind a TLS reverse
+    proxy). A bare host defaults to plain http, which is all the AxeOS firmware
+    serves and is expected on a trusted LAN.
+    """
+    base = host if "://" in host else f"http://{host}"
+    return f"{base}/api/system/info"
+
+
 def fetch_info(host, timeout):
     """GET /api/system/info. Returns parsed dict.
 
     Raises urllib.error.URLError / OSError on network failure, or ValueError on
     a non-200 status or bad JSON.
     """
-    url = f"http://{host}/api/system/info"
+    url = info_url(host)
     req = urllib.request.Request(url, headers={"Accept": "application/json"})
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         if resp.status != 200:
@@ -196,14 +207,19 @@ def send_heartbeat(hb):
         print(f"heartbeat ping failed: {e}", file=sys.stderr)
 
 
-def _push(ntfy, title, body, priority, now, prev):
-    """Send an ntfy push; return the new last_alert (now on success, else old)."""
+def _try_ntfy(ntfy, title, body, priority=None):
+    """Send a push. Return True on success; log and return False on failure."""
     try:
         send_ntfy(ntfy, title, body, priority=priority)
-        return now
+        return True
     except (urllib.error.URLError, OSError, ValueError) as e:
         print(f"ntfy send failed: {e}", file=sys.stderr)
-        return prev.get("last_alert", 0)
+        return False
+
+
+def _push(ntfy, title, body, priority, now, prev):
+    """Send an alarm push; return the new last_alert (now on success, else old)."""
+    return now if _try_ntfy(ntfy, title, body, priority) else prev.get("last_alert", 0)
 
 
 def run_checks(config):
@@ -232,12 +248,12 @@ def run_checks(config):
 
     if not failures:
         state, action = next_state(prev, True, [], now, alerting)
-        if action == "recover":
-            try:
-                send_ntfy(ntfy, "Bitaxe recovered", "All checks back to normal.", priority="default")
-            except (urllib.error.URLError, OSError, ValueError) as e:
-                print(f"ntfy send failed: {e}", file=sys.stderr)
-        save_state(state_path, state)
+        if action == "recover" and not _try_ntfy(
+                ntfy, "Bitaxe recovered", "All checks back to normal.", "default"):
+            # Recovery push failed: keep the unhealthy state so it retries next run.
+            save_state(state_path, prev)
+        else:
+            save_state(state_path, state)
         print(f"OK: healthy. hashRate_10m={info.get('hashRate_10m')} temp={info.get('temp')} "
               f"freq={info.get('frequency')} coreV={info.get('coreVoltage')}")
         return OK
